@@ -22,8 +22,13 @@ class NASDAQSpider(scrapy.Spider):
     _lp_xpath = '//a[@id="quotes_content_left_lb_LastPage"]/@href'
     _nls_tr_xpath = '//table[@id="AfterHoursPagingContents_Table"]/tr'
 
+    def __init__(self):
+        self.q = RedisQueue('Tickers')
+        super(NASDAQSpider, self).__init__()
+
     def start_requests(self):
         #TODO: This will be later adapted to read from a redis queue
+        
         with open(self.tickers_path, 'rb') as f:
             for line in f:
                 ticker = line.strip()
@@ -35,17 +40,24 @@ class NASDAQSpider(scrapy.Spider):
 
 
     def prepare_ticker_scrape(self, response):
+        """ Description: quasi-recursive function that collects the last
+                         page number for every time segment of a stock and 
+                         stores it as meta info to the main parsing 
+                         function ticker_scrape and returns the result of the 
+                         ticker_scrape response
+
+            Input: response (HtmlResponse) => standard iput object that is used
+                                            in scarpy spider parser functions 
+            Output: request => either a recursive request to the same callback 
+                               or to the ticker_parse parse function callback"""
+            
+        # Retrieve the (time segment, last page number) tuple list if it exists
+        # and get the last page url 
         last_pagenos = response.meta.get('LAST_PAGENOS') if response.meta.get('LAST_PAGENOS') else []
         lp_url = response.xpath(self._lp_xpath)
 
-        # Case where page only has one pageno
-        if not lp_url:
-            cur_pageno = 1
-        else:
-            lp_url.extract()[0]
-            qs_dict = parse_qs(urlparse(lp_url).query)
-            cur_pageno = qs_dict['pageno']
-    
+        # Gets the current timestamp and 
+        # puts it into the cur_timeseg variable
         if last_pagenos:
             last_timeseg = last_pagenos[-1][0]
             last_timeseg_index = self.TIME_SEGMENT.index(last_timeseg)
@@ -54,9 +66,28 @@ class NASDAQSpider(scrapy.Spider):
             print 'Collecting metadata for TICKER {}...'.format(response.meta['TICKER'])
             cur_timeseg = '9:30 - 9:59'
 
-        last_pagenos.append( (cur_timeseg, cur_pageno) ) 
-        
-        # Stop at the last time segment
+        # Get the last page number for the current time segment
+        # and stores it in the cur_pageno variable 
+        if not lp_url:
+            cur_pageno = 1
+        else:
+            lp_url.extract()[0]
+            qs_dict = parse_qs(urlparse(lp_url).query)
+            cur_pageno = qs_dict['pageno']
+
+        last_pagenos.append( (cur_timeseg, cur_pageno) )
+    
+        # Edge Case 1: Invalid Ticker
+        if not last_pagenos and not lp_url:
+            pass
+
+        # Edge Case 2: Blacklisted IP
+        if response.status in BAD_HTTP_RESPONSES:
+            # Stop on this thread/ip and change the ip
+            # Report status on the redis queue
+            pass 
+
+        # Base Case: add the last pageno and start the ticker_scrape  
         if cur_timeseg == '15:30 - 16:00':
             last_pagenos_dict = dict(last_pagenos)
             print 'Finished collecting metadata'
@@ -73,19 +104,25 @@ class NASDAQSpider(scrapy.Spider):
             start_request.meta['DATA'] = []
                                      
             return start_request
-        
-        next_timeseg_index = self.TIME_SEGMENT.index(cur_timeseg) + 1
-        next_url = self._generate_url(response.meta['TICKER'], next_timeseg_index, 1) 
-        prepare_request = scrapy.Request(next_url, callback=self.prepare_ticker_scrape, dont_filter=True)
-        prepare_request.meta['TICKER'] = response.meta['TICKER']
-        prepare_request.meta['LAST_PAGENOS'] = last_pagenos 
-        return prepare_request
+        # General Case: The meta data has begun or is continuing to be collected
+        else: 
+            next_timeseg_index = self.TIME_SEGMENT.index(cur_timeseg) + 1
+            next_url = self._generate_url(response.meta['TICKER'], next_timeseg_index, 1) 
+            prepare_request = scrapy.Request(next_url, callback=self.prepare_ticker_scrape, dont_filter=True)
+            prepare_request.meta['TICKER'] = response.meta['TICKER']
+            prepare_request.meta['LAST_PAGENOS'] = last_pagenos 
+            return prepare_request
         
     def ticker_scrape(self, response):
+        """ Purpose: To extract the NLS Time, NLS Price, NLS Volume from a ticker
+                     after the page number meta data has been collected """
+
+        # Base Case: Finised scraping ticker 
         if self._finished_scrape(response.meta['PROGRESS']):
             del response.meta['PROGRESS']
             return { 'TICKER': response.meta['TICKER'],
                      'DATA': response.meta['DATA'] }
+        # General Case
         else:
             # Set up next call
             next_timeseg, next_pageno = self._get_next_url_params(response.meta['PROGRESS'])
@@ -137,6 +174,16 @@ class NASDAQSpider(scrapy.Spider):
             return request
 
     def _get_next_url_params(self, progress):
+        """ Purpose: Gets the next time segment and page number based off current
+                     progress. Time segments increment in increasing order and 
+                     page numbers increment in decreasing order
+            Input:
+                progress (dict) => schema:  { 'LAST_PAGENOS': last_pagenos_dict,
+                                              'TICKER': str(response.meta['TICKER']), 
+                                              'CUR_TIME_SEGMENT': '9:30 - 9:59',
+                                              'CUR_PAGENO': last_pagenos_dict['9:30 - 9:59'] }
+            Output (tuple) => (next time segment, next page number) """
+
         cur_timeseg_index = self.TIME_SEGMENT.index(progress['CUR_TIME_SEGMENT'])
         next_timeseg = self.TIME_SEGMENT[cur_timeseg_index + 1]
         if progress['CUR_PAGENO'] == 1:
@@ -145,13 +192,30 @@ class NASDAQSpider(scrapy.Spider):
             return progress['CUR_TIME_SEGMENT'], progress['CUR_PAGENO'] - 1
 
     def _finished_scrape(self, progress):
+        """ Purpose: boolean function that returns True if the scrape 
+                     is finished 
+            Input: 
+                progress (dict) => schema:  { 'LAST_PAGENOS': last_pagenos_dict,
+                                              'TICKER': str(response.meta['TICKER']), 
+                                              'CUR_TIME_SEGMENT': '9:30 - 9:59',
+                                              'CUR_PAGENO': last_pagenos_dict['9:30 - 9:59'] }
+
+            Output (boolean) """
         if progress['CUR_TIME_SEGMENT'] == '15:30 - 16:00' and progress['CUR_PAGENO'] == 1:
             return True
         else:
             return False
 
     def _generate_url(self, ticker, time_pg, page_no):
-        ''' Generates the url to scrape '''
-        # TODO: Validate
+        """ Purpose: Generates the url to scrape of the form:
+                 http://www.nasdaq.com/symbol/ticker/time-sales?time=time_pg&pageno=page_no   
+            
+            Inputs: 
+                ticker (string) => target ticker
+                time_pg (int) => time segment number
+                page_no (int) => page number corresponding to time segment 
+
+            Output (string) => url corresponding to the stock with the given parameters """
+
         return 'http://www.nasdaq.com/symbol/{}/time-sales?time={}&pageno={}'.format(ticker, time_pg, page_no)
 
